@@ -34,7 +34,8 @@ const ago = (iso) => {
 };
 
 // ------------------------------------------------------------------ mapa
-let map, overlay, frames = [], accOverlay, meta, mode = "frames", idx = 0, timer = null;
+let map, timer = null;
+const R = {index: null, dia: null, scale: "local", prod: "frames", metas: {}, comp: null, sel: new Set(), slots: [], idx: 0, overlays: {}, rings: null, userSel: false};
 
 function initMap(site) {
   map = L.map("map", {zoomControl: true}).setView([site.lat, site.lon], 10);
@@ -72,51 +73,171 @@ function drawStationsOnMap(st) {
 
 function setLegend() {
   const L_ = $("legend");
-  if (mode === "acc") {
-    L_.innerHTML = CLASSES.slice(1).map(c => `<span class="item"><i style="background:${c.color}"></i>${c.label}</span>`).join("");
-  } else if (mode === "frames") {
+  if (R.prod === "acc") {
+    L_.innerHTML = CLASSES.slice(1).map(c => `<span class="item"><i style="background:${c.color}"></i>${c.label}</span>`).join("") + `<span class="item" style="margin-left:4px">mm/día</span>`;
+  } else if (R.prod === "frames") {
     L_.innerHTML = DBZ.map(([v, c]) => `<span class="item"><i style="background:${c}"></i>${v}</span>`).join("") + `<span class="item" style="margin-left:4px">dBZ</span>`;
   } else L_.innerHTML = "";
 }
 
-function showFrame(i) {
-  if (!frames.length) return;
-  idx = (i + frames.length) % frames.length;
-  overlay.setUrl(`data/${frames[idx].png}`);
-  $("slider").value = idx;
-  const s = meta.serie_belen?.find(x => x.t_utc === frames[idx].t_utc);
-  $("frame-time").textContent = fmtDT.format(new Date(frames[idx].t_utc)) + (s?.dbz_belen != null ? ` · ${num(s.dbz_belen)} dBZ` : "");
+// ---- utilidades de radar
+const BLANK = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
+const haversineKm = (a, b, c, d) => {
+  const r = Math.PI / 180, x = Math.sin((c - a) * r / 2) ** 2 + Math.cos(a * r) * Math.cos(c * r) * Math.sin((d - b) * r / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.sqrt(x));
+};
+// Los nombres de cuadro son HHMM en UTC; el día local D va de 05:00 UTC de D a 05:00 UTC de D+1.
+function slotDate(dia, slot) {
+  const y = +dia.slice(0, 4), m = +dia.slice(4, 6) - 1, d = +dia.slice(6, 8), hh = +slot.slice(0, 2), mm = +slot.slice(2, 4);
+  return new Date(Date.UTC(y, m, d + (hh < 5 ? 1 : 0), hh, mm));
+}
+const radarColor = (s) => R.index?.radares?.find(r => r.sitio === s)?.color || "#333";
+
+function layerInfo(key) {   // malla/rutas de una capa en la escala actual, o null
+  const sc = R.scale;
+  if (key === "compuesto" || key === "dominio") {
+    const g = R.comp?.mallas?.[sc];
+    if (!g) return null;
+    return {bounds: g.bounds, frames: g.frames.map(f => f.slot), acc: `radar/${R.dia}/${g.acumulado_png}`,
+            frame: (sl) => `radar/${R.dia}/compuesto/${sc}/frames/${sl}.png`, dominio: `radar/${R.dia}/${g.dominio_png}`};
+  }
+  const m = R.metas[key];
+  if (!m || m.estado !== "ok" || !m.mallas?.[sc]) return null;
+  if (sc === "local" && !m.geometria_belen?.cubre_belen) return null;
+  const g = m.mallas[sc];
+  return {bounds: g.bounds, frames: g.frames.map(f => f.slot), acc: `radar/${R.dia}/${g.acumulado_png}`,
+          frame: (sl) => `radar/${R.dia}/${key}/${sc}/frames/${sl}.png`};
 }
 
-function setMode(m) {
-  mode = m;
-  document.querySelectorAll(".seg button").forEach(b => b.classList.toggle("on", b.dataset.layer === m));
-  if (overlay) overlay.setOpacity(m === "frames" ? 0.85 : 0);
-  if (accOverlay) accOverlay.setOpacity(m === "acc" ? 0.8 : 0);
-  $("player").style.display = m === "frames" ? "flex" : "none";
-  if (m !== "frames") stop();
+function availableLayers() {
+  const names = (R.index?.radares || []).map(r => r.sitio);
+  return [...names, "compuesto", "dominio"].map(k => ({key: k, info: layerInfo(k)}));
+}
+
+function layerReason(k) {
+  if (k === "compuesto" || k === "dominio") return "requiere ≥ 2 radares con datos ese día en esta escala";
+  const m = R.metas[k];
+  if (!m) return "sin datos ese día";
+  if (m.estado !== "ok") return m.estado;
+  if (R.scale === "local" && !m.geometria_belen?.cubre_belen) return `no alcanza Belén (${num(m.geometria_belen?.distancia_km)} km)`;
+  return "";
+}
+
+function renderLayerPicker() {
+  const av = availableLayers();
+  if (!R.userSel) {   // selección por defecto: compuesto si existe, si no todos los radares disponibles
+    R.sel = new Set(av.find(x => x.key === "compuesto" && x.info) ? ["compuesto"] : av.filter(x => x.info && x.key !== "dominio" && x.key !== "compuesto").map(x => x.key));
+  } else {
+    for (const k of [...R.sel]) if (!av.find(x => x.key === k && x.info)) R.sel.delete(k);
+  }
+  const label = (k) => k === "compuesto" ? "Compuesto (haz más bajo)" : k === "dominio" ? "Dominio: qué radar manda" : k;
+  $("layers").innerHTML = av.map(({key, info}) => {
+    const sw = (key === "compuesto" || key === "dominio") ? `<i class="sw" style="background:linear-gradient(90deg,${(R.index?.radares || []).map(r => r.color).join(",")})"></i>` : `<i class="sw" style="background:${radarColor(key)}"></i>`;
+    return `<label class="chk ${info ? "" : "off"}" title="${esc(info ? "" : layerReason(key))}"><input type="checkbox" data-k="${esc(key)}" ${R.sel.has(key) ? "checked" : ""} ${info ? "" : "disabled"}>${sw}${esc(label(key))}${info ? "" : ` <span class="muted">— ${esc(layerReason(key))}</span>`}</label>`;
+  }).join("") + `<label class="chk"><input type="checkbox" id="rings" ${R.rings && map.hasLayer(R.rings) ? "checked" : ""}>Anillos de alcance (300 km)</label>`;
+  $("layers").querySelectorAll("input[data-k]").forEach(cb => cb.addEventListener("change", () => {
+    R.userSel = true;
+    cb.checked ? R.sel.add(cb.dataset.k) : R.sel.delete(cb.dataset.k);
+    refreshOverlays();
+  }));
+  $("rings").addEventListener("change", e => e.target.checked ? R.rings.addTo(map) : R.rings.remove());
+}
+
+function clearOverlays() { for (const o of Object.values(R.overlays)) o.remove(); R.overlays = {}; }
+
+function refreshOverlays() {
+  stop(); clearOverlays();
+  const sel = [...R.sel].map(k => ({key: k, info: layerInfo(k)})).filter(x => x.info);
+  const nImg = sel.filter(x => x.key !== "dominio").length;
+  const op = nImg > 1 ? 0.55 : 0.85;   // con varias capas, semitransparentes para ver la superposición
+  if (R.prod !== "none") {
+    for (const {key, info} of sel) {
+      if (key === "dominio") { R.overlays[key] = L.imageOverlay(`data/${info.dominio}`, info.bounds, {opacity: 0.7, interactive: false}).addTo(map); continue; }
+      const url = R.prod === "acc" ? `data/${info.acc}` : BLANK;
+      R.overlays[key] = L.imageOverlay(url, info.bounds, {opacity: op, interactive: false}).addTo(map);
+    }
+  }
+  const all = new Set(sel.filter(x => x.key !== "dominio").flatMap(x => x.info.frames));
+  R.slots = [...all].sort((a, b) => slotDate(R.dia, a) - slotDate(R.dia, b));
+  $("slider").max = Math.max(R.slots.length - 1, 0);
+  $("player").style.display = R.prod === "frames" && R.slots.length ? "flex" : "none";
+  if (R.prod === "frames") {
+    for (const {key, info} of sel) if (key !== "dominio") info.frames.forEach(sl => { const im = new Image(); im.src = `data/${info.frame(sl)}`; });
+    showFrame(R.slots.length - 1);
+  }
   setLegend();
+  renderRadarNote(sel);
 }
-function stop() { clearInterval(timer); timer = null; $("play").textContent = "▶"; }
 
-async function loadRadar() {
-  const index = await getJSON("radar/index.json");
-  const day = index?.dias?.at(-1);
-  if (!day) { $("radar-note").textContent = "Aún no hay días de radar procesados."; return null; }
-  meta = await getJSON(`radar/${day.dia}/meta.json`);
-  if (!meta) return null;
-  frames = meta.frames || [];
-  const b = meta.bounds;
-  const blank = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
-  overlay = L.imageOverlay(frames[0] ? `data/${frames[0].png}` : blank, b, {opacity: .85, interactive: false}).addTo(map);
-  accOverlay = L.imageOverlay(`data/${meta.acumulado_png}`, b, {opacity: 0, interactive: false}).addTo(map);
-  frames.forEach(f => { const im = new Image(); im.src = `data/${f.png}`; }); // precarga
-  $("slider").max = Math.max(frames.length - 1, 0);
-  showFrame(frames.length - 1);
-  const d = new Date(meta.dia_local + "T12:00:00-05:00");
-  $("radar-note").innerHTML = `Radar ${esc(meta.radar?.sitio ?? "")}: día <b>${fmtD.format(d)}</b> (hora local) · ${meta.volumenes_usados} volúmenes` +
-    `${meta.completo ? "" : " · <b>día incompleto</b>"}. Los datos públicos del IDEAM en AWS llegan con ~1 día de retraso: esto NO es lluvia actual.`;
-  return meta;
+function showFrame(i) {
+  if (!R.slots.length || R.prod !== "frames") return;
+  R.idx = (i + R.slots.length) % R.slots.length;
+  const sl = R.slots[R.idx];
+  const shown = [];
+  for (const [key, o] of Object.entries(R.overlays)) {
+    if (key === "dominio") continue;
+    const info = layerInfo(key);
+    if (info.frames.includes(sl)) { o.setUrl(`data/${info.frame(sl)}`); shown.push(key); } else o.setUrl(BLANK);
+  }
+  $("slider").value = R.idx;
+  const ser = R.metas[[...R.sel].find(k => R.metas[k]?.mallas?.local?.serie_belen)]?.mallas?.local?.serie_belen;
+  const t = slotDate(R.dia, sl);
+  const near = ser?.find(x => Math.abs(new Date(x.t_utc) - t) < 5 * 60e3);
+  $("frame-time").textContent = fmtDT.format(t) + (shown.length < Object.keys(R.overlays).filter(k => k !== "dominio").length ? " · capa(s) sin cuadro" : "")
+    + (R.scale === "local" && near?.dbz_belen != null ? ` · ${num(near.dbz_belen)} dBZ en Belén` : "");
+}
+
+function renderRadarNote(sel) {
+  const d = R.dia ? new Date(`${R.dia.slice(0, 4)}-${R.dia.slice(4, 6)}-${R.dia.slice(6, 8)}T12:00:00-05:00`) : null;
+  const names = sel.map(x => x.key === "compuesto" ? "compuesto" : x.key).join(" + ") || "ninguna capa";
+  $("radar-note").innerHTML = d ? `Día <b>${fmtD.format(d)} ${d.toLocaleDateString("es-CO", {month: "short", year: "numeric", timeZone: TZ})}</b> (hora local) · capas: ${esc(names)}. ` +
+    `Los datos del IDEAM en AWS se publican en lote (≈ 1–24 h de retraso): <b>no es lluvia actual</b>.` : "Aún no hay días de radar procesados.";
+}
+
+function setProd(p) {
+  R.prod = p;
+  document.querySelectorAll("#prod button").forEach(b => b.classList.toggle("on", b.dataset.prod === p));
+  refreshOverlays();
+}
+
+function setScale(sc) {
+  R.scale = sc;
+  document.querySelectorAll("#scale button").forEach(b => b.classList.toggle("on", b.dataset.scale === sc));
+  if (sc === "regional" && R.index?.region_bounds) map.fitBounds(R.index.region_bounds);
+  else map.setView([R.site.lat, R.site.lon], 10);
+  if (sc === "regional" && R.rings && !map.hasLayer(R.rings)) R.rings.addTo(map);
+  renderLayerPicker(); refreshOverlays();
+}
+
+async function loadDay(dia) {
+  R.dia = dia; R.metas = {}; R.comp = null;
+  const ent = R.index.dias.find(d => d.dia === dia);
+  await Promise.all(Object.keys(ent?.radares || {}).map(async s => { R.metas[s] = await getJSON(`radar/${dia}/${s}/meta.json`); }));
+  if (ent?.compuesto) R.comp = await getJSON(`radar/${dia}/compuesto/meta.json`);
+  renderLayerPicker(); refreshOverlays(); renderRadars();
+}
+
+function drawRings() {
+  R.rings = L.layerGroup();
+  for (const r of R.index?.radares || []) {
+    L.circle([r.lat, r.lon], {radius: (r.alcance_km || 300) * 1000, color: r.color, weight: 1.5, fill: false, dashArray: "6 4"}).addTo(R.rings);
+    L.circleMarker([r.lat, r.lon], {radius: 5, color: r.color, weight: 2, fillColor: "#fff", fillOpacity: 1})
+      .bindTooltip(`Radar ${r.sitio}`, {direction: "top"}).addTo(R.rings);
+  }
+}
+
+async function loadRadar(site) {
+  R.site = site;
+  R.index = await getJSON("radar/index.json");
+  if (!R.index?.dias?.length) { renderRadarNote([]); renderRadars(); return; }
+  drawRings();
+  $("day").innerHTML = R.index.dias.map(d => {
+    const n = Object.values(d.radares).filter(r => r.estado === "ok").length;
+    return `<option value="${d.dia}">${d.dia.slice(0, 4)}-${d.dia.slice(4, 6)}-${d.dia.slice(6, 8)} · ${n} radar${n === 1 ? "" : "es"}${d.compuesto ? " · compuesto" : ""}</option>`;
+  }).join("");
+  const last = R.index.dias.at(-1).dia;
+  $("day").value = last;
+  await loadDay(last);
 }
 
 // ------------------------------------------------------------- tarjetas
@@ -188,21 +309,31 @@ function renderImerg(im) {
     <p class="note">${esc(im.fuente.nota)}</p>`;
 }
 
-function renderGeom(m) {
-  if (!m?.geometria_belen) { $("radar-geom").innerHTML = `<p class="muted">Sin día de radar procesado.</p>`; return; }
-  const g = m.geometria_belen;
-  const warn = g.margen_sobre_sitio_m < 1000;
-  $("radar-geom").innerHTML = `<table><tbody>
-    <tr><td>Radar</td><td class="num">${esc(m.radar.sitio)} (${num(m.radar.lat, 4)}, ${num(m.radar.lon, 4)}, ${num(m.radar.alt_m, 0)} m)</td></tr>
-    <tr><td>Distancia a Belén</td><td class="num">${num(g.distancia_km)} km</td></tr>
-    <tr><td>Elevación del barrido usado</td><td class="num">${num(g.elevacion_deg, 2)}°</td></tr>
-    <tr><td>Altura del centro del haz sobre Belén</td><td class="num">${num(g.altura_centro_haz_msnm, 0)} m s.n.m.</td></tr>
-    <tr><td>Altura del sitio</td><td class="num">${num(g.altura_sitio_msnm, 0)} m s.n.m.</td></tr>
-    <tr><td>Margen haz − terreno</td><td class="num"><b class="${warn ? "err" : "ok"}">${num(g.margen_sobre_sitio_m, 0)} m</b></td></tr>
-    <tr><td>Acumulado radar en Belén (${esc(m.dia_local)})</td><td class="num">${num(m.acumulado_belen_mm)} mm</td></tr>
-    <tr><td>Z–R</td><td class="num">Z = ${m.zr.a}·R<sup>${m.zr.b}</sup> (${esc(m.zr.ref)}), umbral ${m.zr.umbral_dbz} dBZ, tope ${m.zr.tope_granizo_dbz} dBZ</td></tr>
-    </tbody></table>
-    <p class="note">${esc(g.modelo)}. ${warn ? "El haz pasa muy cerca del terreno: hay bloqueo parcial y la lámina estimada sobre Belén es indicativa, no medida. " : `El haz muestrea a ~${num(g.altura_centro_haz_msnm / 1000, 1)} km s.n.m.: puede quedar por encima de la lluvia de nubes bajas o dentro de la capa de fusión, y el trayecto de 140 km cruza la cordillera; tiende a subestimar la lluvia orográfica. `}Sin corrección de bloqueo, atenuación ni ajuste con pluviómetros.</p>`;
+function renderRadars() {
+  const rad = R.index?.radares || [];
+  if (!rad.length) { $("radar-geom").innerHTML = `<p class="muted">Sin datos de radar procesados.</p>`; return; }
+  const row = (lbl, f) => `<tr><td>${lbl}</td>${rad.map(r => `<td class="num">${f(r, R.metas[r.sitio])}</td>`).join("")}</tr>`;
+  const dist = (r, m) => m?.geometria_belen?.distancia_km ?? haversineKm(r.lat, r.lon, R.site.lat, R.site.lon);
+  const reach = (r, m) => {
+    const d = dist(r, m);
+    if (m?.geometria_belen) return m.geometria_belen.cubre_belen ? '<b class="ok">sí</b>' : '<b class="err">no</b>';
+    return d > (r.alcance_km || 300) ? `<b class="err">no</b> (&gt; ${num(r.alcance_km || 300, 0)} km)` : "—";
+  };
+  const comp = R.comp?.mallas?.local;
+  $("radar-geom").innerHTML = `<div class="scroll-x"><table><thead><tr><th></th>${rad.map(r => `<th class="num"><i class="sw" style="background:${r.color}"></i>${esc(r.sitio)}</th>`).join("")}</tr></thead><tbody>
+    ${row("Estado el día elegido", (r, m) => m ? esc(m.estado) : "sin datos")}
+    ${row("Último día en el bucket", r => esc(r.ultimo_dia_visto ?? "—"))}
+    ${row("Posición", r => `${num(r.lat, 4)}, ${num(r.lon, 4)}<br><span class="muted">${esc(r.coordenadas)}</span>`)}
+    ${row("Distancia a Belén", (r, m) => `${num(dist(r, m))} km`)}
+    ${row("¿Alcanza Belén?", reach)}
+    ${row("Tarea IRIS / elevación", (r, m) => m?.tarea ? `${esc(m.tarea)} / ${num(m.radar.elevacion_deg, 2)}°` : "—")}
+    ${row("Centro del haz sobre Belén", (r, m) => m?.geometria_belen?.altura_centro_haz_msnm != null ? `${num(m.geometria_belen.altura_centro_haz_msnm, 0)} m s.n.m.` : "—")}
+    ${row("Margen haz − sitio", (r, m) => m?.geometria_belen?.margen_sobre_sitio_m != null ? `${num(m.geometria_belen.margen_sobre_sitio_m, 0)} m` : "—")}
+    ${row("Volúmenes usados", (r, m) => m?.volumenes_usados != null ? `${m.volumenes_usados}${m.completo ? "" : " (incompleto)"}` : "—")}
+    ${row("Acumulado en Belén", (r, m) => m?.mallas?.local?.acumulado_belen_mm != null ? `${num(m.mallas.local.acumulado_belen_mm)} mm` : "—")}
+    </tbody></table></div>
+    ${comp ? `<p class="note"><b>Compuesto en Belén:</b> ${num(comp.acumulado_belen_mm)} mm (manda ${esc(comp.radar_en_belen)}, haz más bajo). Reparto de la ventana: ${Object.entries(comp.fraccion_por_radar).map(([k, v]) => `${esc(k)} ${num(v * 100, 0)} %`).join(", ")}.</p>` : ""}
+    <p class="note">Altura del haz: Tierra efectiva 4/3 (Doviak &amp; Zrnić 1993, ec. 2.28b). Z = 200·R<sup>1,6</sup> (Marshall &amp; Palmer 1948), umbral 10 dBZ, tope 53 dBZ. Compuesto: en cada celda manda el radar que la cubre con el haz más bajo. A más de ~4 km de altura el radar puede quedar por encima de la lluvia de nubes bajas o dentro de la capa de fusión: tiende a subestimar la lluvia orográfica. Sin corrección de bloqueo, atenuación ni ajuste con pluviómetros.</p>`;
 }
 
 function renderSources(estado, parts) {
@@ -231,18 +362,21 @@ async function main() {
   const [st, fc, im] = await Promise.all([getJSON("estaciones.json"), getJSON("pronostico.json"), getJSON("imerg.json")]);
   drawStationsOnMap(st);
   renderNow(st); renderStations(st); renderForecast(fc); renderImerg(im);
-  const m = await loadRadar();
-  renderGeom(m);
-  renderSources(estado, [["estaciones", st], ["imerg", im], ["pronostico", fc], ["radar", m]]);
-  setMode(frames.length ? "frames" : "none");
+  await loadRadar(site);
+  const metas = Object.values(R.metas).filter(m => m?.fuente);
+  const rsrc = metas.length ? {fuente: {...metas[0].fuente, nombre: "IDEAM – Red de radares (AWS Open Data): " + metas.map(m => m.sitio).join(", "),
+    archivos: metas.flatMap(m => m.fuente.archivos)}, procesado_utc: metas.map(m => m.procesado_utc).sort().at(-1)} : null;
+  renderSources(estado, [["estaciones", st], ["imerg", im], ["pronostico", fc], ["radar", rsrc]]);
 }
 
-document.querySelectorAll(".seg button").forEach(b => b.addEventListener("click", () => setMode(b.dataset.layer)));
+document.querySelectorAll("#prod button").forEach(b => b.addEventListener("click", () => setProd(b.dataset.prod)));
+document.querySelectorAll("#scale button").forEach(b => b.addEventListener("click", () => setScale(b.dataset.scale)));
+$("day").addEventListener("change", e => loadDay(e.target.value));
 $("slider").addEventListener("input", e => { stop(); showFrame(Number(e.target.value)); });
 $("play").addEventListener("click", () => {
   if (timer) return stop();
   $("play").textContent = "❚❚";
-  timer = setInterval(() => showFrame(idx + 1), 450);
+  timer = setInterval(() => showFrame(R.idx + 1), 450);
 });
 $("reload").addEventListener("click", () => location.reload());
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});

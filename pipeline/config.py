@@ -17,7 +17,23 @@ GRID_STEP_DEG = 0.005
 # --- Radar IDEAM (AWS Open Data) ---------------------------------------------
 RADAR_BUCKET = "s3-radaresideam"
 RADAR_PREFIX = "l2_data"
-RADAR_SITE = "Barrancabermeja"      # carpeta en el bucket
+# Radares a procesar (nombre = carpeta en el bucket). lat/lon solo se usan hasta que el pipeline
+# lee la posición real del archivo IRIS (queda en data/radar/estado_radares.json).
+RADARS = {
+    "Barrancabermeja": {"lat": 6.93276, "lon": -73.76251, "color": "#e4572e",
+                        "coord_fuente": "archivo IRIS (25-nov-2026)"},
+    "Carimagua": {"lat": 4.57, "lon": -71.33, "color": "#17a398",
+                  "coord_fuente": "APROXIMADA, sin verificar (se reemplaza al leer un archivo)"},
+    "Guaviare": {"lat": 2.53375, "lon": -72.62847, "color": "#7b5ea7",
+                 "coord_fuente": "archivo IRIS vía documentación xradar"},
+}
+RADAR_NOMINAL_RANGE_KM = 300.0      # alcance nominal, guía IDEAM
+# Malla regional que contiene los 300 km de los tres radares (S, W), (N, E) en grados
+REGION_BOUNDS = ((-0.25, -76.50), (9.75, -68.55))
+REGION_STEP_DEG = 0.025             # ≈ 2.8 km
+REGION_FRAME_STEP_MIN = 30          # un cuadro regional cada 30 min (peso de publicación)
+RADAR_KEEP_EXTRA_DAYS = []          # días históricos fijos (AAAAMMDD) que no se borran
+RADAR_FECHA = os.environ.get("RADAR_FECHA", "").strip()  # AAAA-MM-DD: procesar ese día local
 RADAR_MAX_LOOKBACK_DAYS = 4         # hasta cuántos días atrás buscar datos
 RADAR_FRAME_STEP_MIN = 10           # 1 PNG cada N min (la acumulación usa TODOS los volúmenes)
 RADAR_MAX_DT_MIN = 10.0             # tope del intervalo de integración entre volúmenes, min

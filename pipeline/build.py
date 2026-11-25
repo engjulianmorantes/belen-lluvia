@@ -45,7 +45,8 @@ def main():
             _write(out, res)
     if "--sin-radar" not in sys.argv:
         import radar
-        res = _step("radar", lambda: radar.run(C.OUT_DIR), estado)
+        fecha = dt.date.fromisoformat(C.RADAR_FECHA) if C.RADAR_FECHA else None
+        res = _step("radar", lambda: radar.run(C.OUT_DIR, fecha=fecha), estado)
         if res is not None:
             estado["radar"]["resultado"] = res
     _write("estado.json", {"sitio": sitio, "generado_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),

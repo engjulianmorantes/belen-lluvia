@@ -29,11 +29,17 @@
   <section class="card map-card">
     <div id="map"></div>
     <div class="map-controls">
-      <div class="seg" role="tablist">
-        <button data-layer="frames" class="on">Reflectividad</button>
-        <button data-layer="acc">Acumulado radar</button>
-        <button data-layer="none">Sin radar</button>
+      <div class="seg" id="scale" role="tablist">
+        <button data-scale="local" class="on">Belén · 40 km</button>
+        <button data-scale="regional">Regional · 3 radares</button>
       </div>
+      <div class="seg" id="prod" role="tablist">
+        <button data-prod="frames" class="on">Reflectividad</button>
+        <button data-prod="acc">Acumulado del día</button>
+        <button data-prod="none">Sin radar</button>
+      </div>
+      <label class="day">Día de radar <select id="day"></select></label>
+      <div id="layers" class="layers"></div>
       <div class="player" id="player">
         <button id="play" aria-label="Reproducir">▶</button>
         <input id="slider" type="range" min="0" max="0" value="0" aria-label="Hora del barrido">
@@ -61,7 +67,7 @@
   </section>
 
   <section class="card">
-    <h2>Radar IDEAM — geometría sobre Belén</h2>
+    <h2>Radares IDEAM — comparación sobre Belén</h2>
     <div id="radar-geom"></div>
   </section>
 

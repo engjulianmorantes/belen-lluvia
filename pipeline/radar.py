@@ -1,21 +1,28 @@
-"""Procesamiento de volúmenes IRIS (.RAW) del radar IDEAM de Barrancabermeja.
+"""Procesamiento multi-radar de volúmenes IRIS (.RAW) de la red IDEAM (s3://s3-radaresideam).
 
-Flujo por día local (UTC-5):
-  1. Listar en S3 los volúmenes cuyo sello de tiempo (en el nombre, UTC) cae en el día local.
-  2. Por volumen: abrir con xradar (engine IRIS), escoger el barrido de menor elevación
-     cuyo alcance cubra toda la ventana de Belén, remuestrear dBZ a la malla lat/lon
-     por vecino más cercano en (azimut, rango oblicuo).
-  3. R = (Z/a)^(1/b)  (Marshall-Palmer, a=200, b=1.6), acumulación por regla rectangular
-     hacia adelante con Δt = min(t_{i+1} − t_i, RADAR_MAX_DT_MIN).
-  4. PNG de reflectividad cada RADAR_FRAME_STEP_MIN, PNG de acumulado diario y meta.json.
+Por cada radar de C.RADARS y cada día local (UTC-5):
+  1. Listar el día (carpetas D y D+1, filtrando por el sello UTC del nombre: el bucket ha usado
+     carpetas por día UTC (ene-2026) y por día local (nov-2026)). Quitar duplicados por
+     (sello, tamaño): Barrancabermeja publica cada volumen dos veces (.RAW7xxx/.RAWZxxx, mismo
+     tamaño); Carimagua publica volúmenes DISTINTOS con el mismo sello (distinto tamaño).
+  2. Elegir UNA tarea IRIS (atributo `scan_name` del archivo) probando los volúmenes de una
+     ventana de 30 min: la de menor elevación que alcanza Belén; si ninguna lo alcanza, la de
+     mayor alcance (solo vista regional). Se filtran los volúmenes del día por la "huella" de la
+     tarea (posición en el ciclo de 5 min y tamaño) y se verifica `scan_name` al abrir cada uno.
+  3. Remuestrear dBZ del barrido más bajo de esa tarea a dos mallas lat/lon (vecino más cercano
+     en azimut y rango oblicuo, Tierra efectiva 4/3): local (Belén, 40 km) y regional.
+  4. R = (Z/a)^(1/b) (Marshall-Palmer), acumulado con Δt = min(t_{i+1} − t_i, RADAR_MAX_DT_MIN).
+  5. Compuesto "haz más bajo": en cada celda y paso de tiempo se toma el radar que cubre la celda
+     con el centro del haz más cercano al suelo.
 
-LIMITACIÓN: sin corrección de bloqueo orográfico, atenuación ni calibración con
-pluviómetros. Los mm del radar sobre Belén son indicativos, no medidos.
+LIMITACIÓN: sin corrección de bloqueo orográfico, atenuación, banda brillante ni ajuste con
+pluviómetros. Las láminas del radar son indicativas.
 """
 from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 import re
 import shutil
@@ -33,32 +40,15 @@ COL = dt.timezone(dt.timedelta(hours=-5))
 FNAME_RE = re.compile(r"^[A-Z]{3}(\d{12})\.RAW", re.I)
 DBZ_FIELDS = ("DBZH", "DBZ", "reflectivity", "DBTH")
 
-# Escala de reflectividad (dBZ) tipo NWS: límite inferior de cada clase y color RGB
 DBZ_LEVELS = [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65]
 DBZ_COLORS = [(4, 233, 231), (1, 159, 244), (3, 0, 244), (2, 253, 2), (1, 197, 1),
               (0, 142, 0), (253, 248, 2), (229, 188, 0), (253, 149, 0), (253, 0, 0),
               (212, 0, 0), (188, 0, 0)]
-# Clases de acumulado diario (mm) — mismas del visor SAB/IDIGER
-ACC_LEVELS = [0.1, 10.0, 30.0, 50.0]
+ACC_LEVELS = [0.1, 10.0, 30.0, 50.0]          # clases SAB/IDIGER, mm
 ACC_COLORS = [(52, 120, 246), (46, 170, 70), (245, 140, 20), (140, 60, 190)]
 
 
-# ----------------------------------------------------------------------------- S3
-def _s3():
-    import boto3
-    from botocore import UNSIGNED
-    from botocore.config import Config
-    return boto3.client("s3", region_name="us-east-1", config=Config(signature_version=UNSIGNED))
-
-
-def list_keys_utc_day(s3, day_utc: dt.date) -> list[str]:
-    prefix = f"{C.RADAR_PREFIX}/{day_utc:%Y/%m/%d}/{C.RADAR_SITE}/"
-    keys = []
-    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=C.RADAR_BUCKET, Prefix=prefix):
-        keys += [o["Key"] for o in page.get("Contents", [])]
-    return keys
-
-
+# ============================================================================ utilidades
 def key_time_utc(key: str) -> dt.datetime | None:
     m = FNAME_RE.match(os.path.basename(key))
     if not m:
@@ -66,58 +56,108 @@ def key_time_utc(key: str) -> dt.datetime | None:
     return dt.datetime.strptime(m.group(1), "%y%m%d%H%M%S").replace(tzinfo=UTC)
 
 
-def task_class(t: dt.datetime) -> int:
-    """El radar corre 4 tareas por ciclo de 5 min (observado nov-2026: :x0:04, :x1:08, :x2:39, :x3:17).
-    El minuto módulo 5 identifica la tarea sin abrir el archivo."""
-    return t.minute % 5
+def cycle_offset_s(t: dt.datetime) -> int:
+    """Posición del volumen dentro del ciclo de 5 min, s (0–299)."""
+    return (t.minute % 5) * 60 + t.second
 
 
-def dedupe(keys):
-    """Cada volumen se publica DOS veces con igual tamaño/ETag (extensiones .RAW7xxx y .RAWZxxx).
-    Se conserva una clave por sello de tiempo."""
+def slot_name(t: dt.datetime, step_min: int) -> str:
+    m = (t.hour * 60 + t.minute) // step_min * step_min
+    return f"{m // 60:02d}{m % 60:02d}"
+
+
+def dedupe(objs):
+    """objs: [{'Key','Size'}]. Quita copias idénticas (mismo sello y tamaño)."""
     seen, out = set(), []
-    for k in sorted(keys):
-        t = key_time_utc(k)
-        if t and t not in seen:
-            seen.add(t)
-            out.append(k)
+    for o in sorted(objs, key=lambda o: o["Key"]):
+        t = key_time_utc(o["Key"])
+        if t is None:
+            continue
+        sig = (t, int(o.get("Size", -1)))
+        if sig not in seen:
+            seen.add(sig)
+            out.append(o)
     return out
 
 
-def keys_for_local_day(s3, day_local: dt.date):
-    """Volúmenes del día local [00:00, 24:00) UTC-5. Las carpetas del bucket se organizan por día
-    LOCAL (la carpeta D contiene sellos UTC de ~05 h del día D a ~05 h del día D+1); por robustez
-    se listan D y D+1 y se filtra por el sello del nombre (UTC).
-    Devuelve (keys_ordenadas_sin_duplicados, completo)."""
+def dbz_to_rate_mmh(dbz):
+    """Marshall-Palmer: Z = a·R^b → R = (10^(dBZ/10)/a)^(1/b) [mm/h]."""
+    dbz = np.asarray(dbz, dtype=float)
+    with np.errstate(invalid="ignore"):
+        z = 10.0 ** (np.minimum(dbz, C.RADAR_HAIL_CAP_DBZ) / 10.0)
+        r = (z / C.ZR_A) ** (1.0 / C.ZR_B)
+    return np.where(np.isfinite(dbz) & (dbz >= C.RADAR_MIN_DBZ), r, 0.0)
+
+
+def enc_dbz(dbz):
+    """dBZ → uint8 (0 = sin eco/NaN; paso 0,5 dB desde −32 dBZ)."""
+    v = np.rint((np.asarray(dbz, float) + 32.0) * 2.0)
+    v = np.where(np.isfinite(v), np.clip(v, 1, 255), 0)
+    return v.astype(np.uint8)
+
+
+def dec_dbz(u8):
+    u = np.asarray(u8, float)
+    return np.where(u > 0, u / 2.0 - 32.0, np.nan)
+
+
+# ============================================================================ S3
+def _s3():
+    import boto3
+    from botocore import UNSIGNED
+    from botocore.config import Config
+    return boto3.client("s3", region_name="us-east-1", config=Config(signature_version=UNSIGNED,
+                                                                       max_pool_connections=16))
+
+
+def list_folder(s3, site, day):
+    prefix = f"{C.RADAR_PREFIX}/{day:%Y/%m/%d}/{site}/"
+    out = []
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=C.RADAR_BUCKET, Prefix=prefix):
+        out += [{"Key": o["Key"], "Size": o["Size"]} for o in page.get("Contents", [])]
+    return out
+
+
+def objs_for_local_day(s3, site, day_local):
     t0 = dt.datetime.combine(day_local, dt.time(0), COL)
     t1 = t0 + dt.timedelta(days=1)
-    raw = list_keys_utc_day(s3, day_local) + list_keys_utc_day(s3, day_local + dt.timedelta(days=1))
-    keys = [k for k in dedupe(raw) if t0 <= key_time_utc(k) < t1]
-    keys.sort(key=key_time_utc)
-    complete = bool(keys) and key_time_utc(keys[-1]) >= t1 - dt.timedelta(minutes=20)
-    return keys, complete
+    raw = list_folder(s3, site, day_local) + list_folder(s3, site, day_local + dt.timedelta(days=1))
+    objs = [o for o in dedupe(raw) if t0 <= key_time_utc(o["Key"]) < t1]
+    objs.sort(key=lambda o: key_time_utc(o["Key"]))
+    complete = bool(objs) and key_time_utc(objs[-1]["Key"]) >= t1 - dt.timedelta(minutes=20)
+    return objs, complete
 
 
-def find_latest_local_day(s3, today_local: dt.date):
-    for back in range(1, C.RADAR_MAX_LOOKBACK_DAYS + 1):
-        d = today_local - dt.timedelta(days=back)
-        keys, complete = keys_for_local_day(s3, d)
-        if keys:
-            return d, keys, complete
-    return None, [], False
+def folder_exists(s3, site, day):
+    r = s3.list_objects_v2(Bucket=C.RADAR_BUCKET, Prefix=f"{C.RADAR_PREFIX}/{day:%Y/%m/%d}/{site}/", MaxKeys=1)
+    return r.get("KeyCount", 0) > 0
 
 
-# ------------------------------------------------------------------- lectura IRIS
-def open_lowest_sweep(path: str, need_ground_range_m: float):
-    """Abre el archivo y devuelve (dataset_barrido, nombre_campo, elevación_°, lat, lon, alt).
-    Escoge el barrido de menor elevación cuyo rango cubre need_ground_range_m."""
+def last_seen(s3, site, today, cached=None):
+    """Último día con carpeta del radar. Diario hasta 30 d, luego semanal hasta ~18 meses.
+    Si hay un valor en caché, solo se revisan los días posteriores a él."""
+    stop = dt.date.fromisoformat(cached) if cached else None
+    steps = list(range(0, 31)) + list(range(35, 550, 7))
+    for k in steps:
+        d = today - dt.timedelta(days=k)
+        if stop and d <= stop:
+            return cached
+        if folder_exists(s3, site, d):
+            return d.isoformat()
+    return cached
+
+
+# ============================================================================ IRIS
+def read_volume(path, site_ground_m):
+    """Devuelve dict con tarea, posición y barrido elegido, o None si no hay campo dBZ.
+    Barrido: el de menor elevación que alcanza site_ground_m; si ninguno, el de mayor alcance."""
     import xarray as xr
     tree = xr.open_datatree(path, engine="iris")
     root = tree.to_dataset()
-    lat = float(root["latitude"].values)
-    lon = float(root["longitude"].values)
-    alt = float(root["altitude"].values)
-    best = None
+    info = {"tarea": str(tree.attrs.get("scan_name", "")).strip() or "?",
+            "lat": float(root["latitude"].values), "lon": float(root["longitude"].values),
+            "alt": float(root["altitude"].values)}
+    cands = []
     for name in tree.children:
         if not name.startswith("sweep_"):
             continue
@@ -126,55 +166,76 @@ def open_lowest_sweep(path: str, need_ground_range_m: float):
         if field is None:
             continue
         elev = float(ds["sweep_fixed_angle"].values)
-        rmax = float(ds["range"].values[-1])
-        if geo.ground_range_m(rmax, elev) < need_ground_range_m:
-            continue
-        if best is None or elev < best[2]:
-            best = (ds, field, elev)
-    if best is None:
+        reach = float(geo.ground_range_m(float(ds["range"].values[-1]), elev))
+        cands.append((ds, field, elev, reach))
+    if not cands:
         return None
-    ds, field, elev = best
-    return ds, field, elev, lat, lon, alt
+    covering = [c for c in cands if c[3] >= site_ground_m]
+    ds, field, elev, reach = (min(covering, key=lambda c: (c[2], -c[3])) if covering
+                              else max(cands, key=lambda c: (c[3], -c[2])))
+    info.update(ds=ds, field=field, elev=elev, reach_m=reach, cubre_sitio=bool(covering))
+    return info
 
 
-def polar_to_grid(ds, field, elev_deg, grid_az, grid_ground_m, max_az_gap_deg=1.0):
-    """Vecino más cercano en azimut y rango oblicuo. Devuelve dBZ en la malla (NaN fuera)."""
-    az = np.asarray(ds["azimuth"].values, dtype=float)
+def polar_to_grid(ds, field, elev_deg, grid_az, grid_ground, max_az_gap_deg=1.0):
+    """Vecino más cercano en azimut (ordenado, con vuelta en 360°) y en rango oblicuo.
+    Devuelve (dBZ en la malla con NaN donde no hay eco o no hay cobertura, máscara de cobertura)."""
+    az = np.asarray(ds["azimuth"].values, dtype=float) % 360.0
     rng = np.asarray(ds["range"].values, dtype=float)
-    data = np.asarray(ds[field].values, dtype=float)  # (n_az, n_rng)
-    # índice de azimut: diferencia angular mínima (con vuelta en 360°)
-    d = np.abs(((grid_az[..., None] - az[None, None, :]) + 180.0) % 360.0 - 180.0)
-    ia = np.argmin(d, axis=-1)
-    az_ok = np.take_along_axis(d, ia[..., None], axis=-1)[..., 0] <= max_az_gap_deg
-    # índice de rango: distancia sobre superficie → rango oblicuo
-    r_slant = geo.slant_from_ground_m(grid_ground_m, elev_deg)
+    data = np.asarray(ds[field].values, dtype=float)
+    order = np.argsort(az)
+    az_s = az[order]
+    ext = np.concatenate([az_s[-1:] - 360.0, az_s, az_s[:1] + 360.0])
+    idx_ext = np.concatenate([order[-1:], order, order[:1]])
+    pos = np.clip(np.searchsorted(ext, grid_az), 1, ext.size - 1)
+    left, right = ext[pos - 1], ext[pos]
+    use_left = (grid_az - left) <= (right - grid_az)
+    j = np.where(use_left, pos - 1, pos)
+    ia = idx_ext[j]
+    az_ok = np.abs(grid_az - ext[j]) <= max_az_gap_deg
+    r_slant = geo.slant_from_ground_m(grid_ground, elev_deg)
     dr = rng[1] - rng[0]
     ir = np.rint((r_slant - rng[0]) / dr)
     r_ok = np.isfinite(ir) & (ir >= 0) & (ir < rng.size)
     ir = np.where(r_ok, ir, 0).astype(int)
+    cover = az_ok & r_ok
     out = data[ia, ir]
-    out[~(az_ok & r_ok)] = np.nan
-    return out
+    out[~cover] = np.nan
+    return out, cover
 
 
-def dbz_to_rate_mmh(dbz):
-    """Marshall-Palmer: Z = a·R^b  →  R = (10^(dBZ/10) / a)^(1/b)   [mm/h]."""
-    dbz = np.asarray(dbz, dtype=float)
-    z = 10.0 ** (np.minimum(dbz, C.RADAR_HAIL_CAP_DBZ) / 10.0)
-    r = (z / C.ZR_A) ** (1.0 / C.ZR_B)
-    r = np.where(np.isfinite(dbz) & (dbz >= C.RADAR_MIN_DBZ), r, 0.0)
-    return r
+# ============================================================================ mallas
+class Grid:
+    def __init__(self, name, lats, lons, bounds, inside, step_min):
+        self.name, self.lats, self.lons, self.bounds, self.inside = name, lats, lons, bounds, inside
+        self.step_min = step_min
+        self.LAT, self.LON = np.meshgrid(lats, lons, indexing="ij")
 
 
-# -------------------------------------------------------------------- imágenes
-def _classify_rgba(values, levels, colors, inside, alpha=200):
+def local_grid():
+    lats, lons, bounds, inside = geo.make_grid(C.SITE_LAT_DEG, C.SITE_LON_DEG, C.AOI_RADIUS_KM, C.GRID_STEP_DEG)
+    return Grid("local", lats, lons, bounds, inside, C.RADAR_FRAME_STEP_MIN)
+
+
+def regional_grid():
+    (s, w), (n, e) = C.REGION_BOUNDS
+    st = C.REGION_STEP_DEG
+    lats = np.arange(n - st / 2, s, -st)
+    lons = np.arange(w + st / 2, e, st)
+    bounds = [[float(lats[-1] - st / 2), float(lons[0] - st / 2)], [float(lats[0] + st / 2), float(lons[-1] + st / 2)]]
+    return Grid("regional", lats, lons, bounds, np.ones((lats.size, lons.size), bool), C.REGION_FRAME_STEP_MIN)
+
+
+# ============================================================================ imágenes
+def classify_rgba(values, levels, colors, mask, alpha=200):
     v = np.asarray(values, float)
     rgba = np.zeros(v.shape + (4,), np.uint8)
-    for i, lo in enumerate(levels):
-        hi = levels[i + 1] if i + 1 < len(levels) else np.inf
-        m = (v >= lo) & (v < hi) & inside
-        rgba[m, :3] = colors[i]
-        rgba[m, 3] = alpha
+    with np.errstate(invalid="ignore"):
+        for i, lo in enumerate(levels):
+            hi = levels[i + 1] if i + 1 < len(levels) else np.inf
+            m = (v >= lo) & (v < hi) & mask
+            rgba[m, :3] = colors[i]
+            rgba[m, 3] = alpha
     return rgba
 
 
@@ -183,195 +244,352 @@ def save_png(rgba, path):
     Image.fromarray(rgba, "RGBA").save(path, optimize=True)
 
 
-# -------------------------------------------------------------------- proceso
-def process_local_day(day_local, keys, complete, out_root, s3=None, local_files=None):
-    """Procesa un día. local_files: lista de rutas locales (pruebas) en lugar de S3."""
-    lats, lons, bounds, inside = geo.make_grid(C.SITE_LAT_DEG, C.SITE_LON_DEG, C.AOI_RADIUS_KM, C.GRID_STEP_DEG)
-    ic, jc = len(lats) // 2, len(lons) // 2  # celda de Belén
-    LAT, LON = np.meshgrid(lats, lons, indexing="ij")
-    near5 = geo.geodesic(C.SITE_LAT_DEG, C.SITE_LON_DEG, LAT, LON)[1] <= 5000.0
+def _hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
-    day_dir = os.path.join(out_root, "radar", f"{day_local:%Y%m%d}")
-    os.makedirs(day_dir, exist_ok=True)
-    acc = np.zeros(LAT.shape)
-    series, frames, used_keys, skipped = [], [], [], []
-    radar_geom = None
-    grid_az = grid_ground = None
-    last_frame_slot = None
 
-    items = local_files if local_files is not None else keys
-    tmp = tempfile.mkdtemp(prefix="radar_")
+# ============================================================================ un radar, un día
+def process_radar_day(site, day_local, objs, complete, day_dir, s3, grids, fetch_local=None):
+    """Procesa un radar en un día. Escribe PNG/meta y grids.npz en day_dir/<sitio>/.
+    fetch_local(key)->ruta permite pruebas sin S3."""
+    cfg = C.RADARS[site]
+    out = os.path.join(day_dir, site)
+    shutil.rmtree(out, ignore_errors=True)
+    os.makedirs(out, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=f"rad_{site}_")
+    geo_cache = {}
+    meta = {"sitio": site, "dia_local": day_local.isoformat(), "zona_horaria": "UTC-05:00",
+            "completo": bool(complete), "volumenes_listados": len(objs), "omitidos": []}
+
+    def fetch(o):
+        if fetch_local:
+            return o, fetch_local(o["Key"])
+        p = os.path.join(tmp, os.path.basename(o["Key"]) + f".{o['Size']}")
+        s3.download_file(C.RADAR_BUCKET, o["Key"], p)
+        return o, p
+
+    def cleanup(p):
+        if not fetch_local and os.path.exists(p):
+            os.remove(p)
+
+    def site_ground(lat, lon):
+        return float(geo.geodesic(lat, lon, C.SITE_LAT_DEG, C.SITE_LON_DEG)[1])
+
     try:
-        def fetch(k):
-            if local_files is not None:
-                return k, k
-            p = os.path.join(tmp, os.path.basename(k))
-            s3.download_file(C.RADAR_BUCKET, k, p)
-            return k, p
-
-        def cleanup(p):
-            if local_files is None and os.path.exists(p):
-                os.remove(p)
-
-        def need_range(p):
-            nonlocal radar_geom, grid_az, grid_ground
-            if radar_geom is None:  # primera lectura: posición real del radar
-                import xarray as xr
-                root = xr.open_datatree(p, engine="iris").to_dataset()
-                radar_geom = (float(root["latitude"].values), float(root["longitude"].values))
-                grid_az, grid_ground = geo.geodesic(radar_geom[0], radar_geom[1], LAT, LON)
-            return float(np.nanmax(grid_ground[inside]))
-
-        # 1) Selección de tarea: se prueba un volumen de cada tarea (minuto mód 5) y se usa
-        #    solo la que cubre toda la ventana con la menor elevación. Mezclar tareas daría
-        #    elevaciones distintas entre cuadros y sesgo en el acumulado.
+        # ---------- 1) prueba de tareas en una ventana de 30 min (mediodía local, o la mitad del día)
+        times = [key_time_utc(o["Key"]) for o in objs]
+        mid = dt.datetime.combine(day_local, dt.time(12), COL)
+        win = [o for o, t in zip(objs, times) if mid <= t < mid + dt.timedelta(minutes=30)]
+        if len(win) < 3:
+            k0 = len(objs) // 2
+            win = objs[k0:k0 + 30]
         tareas = {}
-        if local_files is None:
-            by_cls = {}
-            for k in items:
-                by_cls.setdefault(task_class(key_time_utc(k)), []).append(k)
-            for c, ks in sorted(by_cls.items()):
-                k, p = fetch(ks[len(ks) // 2])
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for o, p in ex.map(fetch, win):
                 try:
-                    res = open_lowest_sweep(p, need_range(p))
-                    tareas[c] = {"n": len(ks), "muestra": k, "cubre": res is not None,
-                                 "elev_deg": None if res is None else round(res[2], 2),
-                                 "rango_max_km": None if res is None else round(float(res[0]["range"].values[-1]) / 1000, 1)}
+                    v = read_volume(p, cfg.get("_ground_m", 0.0) or 1e9)
+                    if v is None:
+                        continue
+                    if "_ground_m" not in cfg:
+                        cfg["_ground_m"] = site_ground(v["lat"], v["lon"])
+                        v = read_volume(p, cfg["_ground_m"])
+                    d = tareas.setdefault(v["tarea"], {"n_prueba": 0, "offsets_s": set(), "tam": [], "elev_deg": v["elev"],
+                                                       "alcance_km": round(v["reach_m"] / 1000, 1), "cubre_belen": v["cubre_sitio"]})
+                    d["n_prueba"] += 1
+                    d["offsets_s"].add(cycle_offset_s(key_time_utc(o["Key"])))
+                    d["tam"].append(o["Size"])
                 except Exception as e:
-                    tareas[c] = {"n": len(ks), "muestra": k, "cubre": False, "error": f"{type(e).__name__}: {e}"[:200]}
+                    meta["omitidos"].append({"key": o["Key"], "motivo": f"prueba: {type(e).__name__}: {e}"[:200]})
                 finally:
                     cleanup(p)
-            ok = [c for c, v in tareas.items() if v["cubre"]]
-            if ok:
-                best = min(ok, key=lambda c: (tareas[c]["elev_deg"], -tareas[c]["rango_max_km"], -tareas[c]["n"]))
-                tareas[best]["elegida"] = True
-                items = by_cls[best]
+        if not tareas:
+            meta["estado"] = "sin volúmenes legibles en la ventana de prueba"
+            return meta, None
+        cub = [k for k, v in tareas.items() if v["cubre_belen"]]
+        best = (min(cub, key=lambda k: (tareas[k]["elev_deg"], -tareas[k]["alcance_km"])) if cub
+                else max(tareas, key=lambda k: (tareas[k]["alcance_km"], -tareas[k]["elev_deg"])))
+        bt = tareas[best]
+        offs, tmin, tmax = sorted(bt["offsets_s"]), min(bt["tam"]), max(bt["tam"])
+        meta["tareas_probadas"] = {k: {**{kk: vv for kk, vv in v.items() if kk not in ("offsets_s", "tam")},
+                                       "offsets_s": sorted(v["offsets_s"]), "tam_bytes": [min(v["tam"]), max(v["tam"])],
+                                       "elegida": k == best} for k, v in tareas.items()}
 
-        # 2) Proceso por lotes (acota el disco usado a ~12 volúmenes a la vez)
+        def near_offset(o):
+            x = cycle_offset_s(key_time_utc(o["Key"]))
+            return min(min(abs(x - y), 300 - abs(x - y)) for y in offs) <= 25
+
+        cand = [o for o in objs if near_offset(o) and 0.5 * tmin <= o["Size"] <= 2.0 * tmax]
+        meta["tarea"] = best
+        meta["volumenes_candidatos"] = len(cand)
+
+        # ---------- 2) proceso
         scans = []
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            for i0 in range(0, len(items), 12):
-                for k, p in ex.map(fetch, items[i0:i0 + 12]):
-                    t = key_time_utc(k)
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for i0 in range(0, len(cand), 16):
+                for o, p in ex.map(fetch, cand[i0:i0 + 16]):
+                    t = key_time_utc(o["Key"])
                     try:
-                        res = open_lowest_sweep(p, need_range(p))
-                        if res is None:
-                            skipped.append({"key": k, "motivo": "ningún barrido cubre la ventana"})
+                        v = read_volume(p, cfg["_ground_m"])
+                        if v is None or v["tarea"] != best:
+                            meta["omitidos"].append({"key": o["Key"], "motivo": f"otra tarea ({None if v is None else v['tarea']})"})
                             continue
-                        ds, field, elev, rlat, rlon, ralt = res
-                        if (rlat, rlon) != radar_geom:
-                            grid_az, grid_ground = geo.geodesic(rlat, rlon, LAT, LON)
-                            radar_geom = (rlat, rlon)
-                        dbz = polar_to_grid(ds, field, elev, grid_az, grid_ground)
-                        scans.append((t, k, dbz, field, elev, rlat, rlon, ralt))
-                    except Exception as e:  # archivo corrupto, formato inesperado
-                        skipped.append({"key": k, "motivo": f"{type(e).__name__}: {e}"[:200]})
+                        if abs(v["elev"] - bt["elev_deg"]) > 0.05:
+                            meta["omitidos"].append({"key": o["Key"], "motivo": f"elevación {v['elev']:.2f}° ≠ {bt['elev_deg']:.2f}°"})
+                            continue
+                        gkey = (round(v["lat"], 5), round(v["lon"], 5))
+                        res = {}
+                        for g in grids:
+                            ck = (g.name, gkey)
+                            if ck not in geo_cache:
+                                geo_cache[ck] = geo.geodesic(v["lat"], v["lon"], g.LAT, g.LON)
+                            az, gr = geo_cache[ck]
+                            dbz_g, cov_g = polar_to_grid(v["ds"], v["field"], v["elev"], az, gr)
+                            res[g.name] = (dbz_g.astype(np.float32), cov_g)
+                        scans.append((t, o["Key"], res, v))
+                    except Exception as e:
+                        meta["omitidos"].append({"key": o["Key"], "motivo": f"{type(e).__name__}: {e}"[:200]})
                     finally:
                         cleanup(p)
+        if not scans:
+            meta["estado"] = "sin volúmenes válidos de la tarea elegida"
+            return meta, None
 
         scans.sort(key=lambda s: s[0])
-        times = [s[0] for s in scans]
-        gaps = [(times[i + 1] - times[i]).total_seconds() / 60 for i in range(len(times) - 1)]
+        tt = [s[0] for s in scans]
+        gaps = [(tt[i + 1] - tt[i]).total_seconds() / 60 for i in range(len(tt) - 1)]
         med = float(np.median(gaps)) if gaps else 5.0
-        for i, (t, k, dbz, field, elev, rlat, rlon, ralt) in enumerate(scans):
-            dt_min = min(gaps[i] if i < len(gaps) else med, C.RADAR_MAX_DT_MIN)
-            rate = dbz_to_rate_mmh(dbz)
-            acc += rate * dt_min / 60.0
-            used_keys.append(k)
-            v = dbz[ic, jc]
-            series.append({
-                "t_utc": t.isoformat(),
-                "dbz_belen": None if not np.isfinite(v) else round(float(v), 1),
-                "r_belen_mmh": round(float(rate[ic, jc]), 2),
-                "r_max5km_mmh": round(float(np.max(rate[near5])), 2),
-                "dt_min": round(dt_min, 2),
-            })
-            slot = int((t.hour * 60 + t.minute) // C.RADAR_FRAME_STEP_MIN)
-            if slot != last_frame_slot:
-                last_frame_slot = slot
-                name = f"{t:%H%M}.png"
-                save_png(_classify_rgba(dbz, DBZ_LEVELS, DBZ_COLORS, inside), os.path.join(day_dir, "frames", name))
-                frames.append({"t_utc": t.isoformat(), "png": f"radar/{day_local:%Y%m%d}/frames/{name}"})
+        v0 = scans[0][3]
+        rlat, rlon, ralt, elev = v0["lat"], v0["lon"], v0["alt"], v0["elev"]
 
-        save_png(_classify_rgba(acc, ACC_LEVELS, ACC_COLORS, inside, alpha=170), os.path.join(day_dir, "acumulado.png"))
+        npz, gmeta = {}, {}
+        for g in grids:
+            acc = np.zeros(g.LAT.shape)
+            cover = np.zeros(g.LAT.shape, bool)
+            frames, fr_u8, fr_names, last = [], [], [], None
+            for i, (t, k, res, _) in enumerate(scans):
+                dbz, cov = res[g.name]
+                cover |= cov
+                dtm = min(gaps[i] if i < len(gaps) else med, C.RADAR_MAX_DT_MIN)
+                acc += dbz_to_rate_mmh(dbz) * dtm / 60.0
+                sn = slot_name(t, g.step_min)
+                if sn != last:
+                    last = sn
+                    save_png(classify_rgba(dbz, DBZ_LEVELS, DBZ_COLORS, g.inside), os.path.join(out, g.name, "frames", f"{sn}.png"))
+                    frames.append({"slot": sn, "t_utc": t.isoformat()})
+                    fr_u8.append(enc_dbz(dbz))
+                    fr_names.append(sn)
+            az, gr = geo_cache[(g.name, (round(rlat, 5), round(rlon, 5)))]
+            beam = geo.beam_height_m(geo.slant_from_ground_m(gr, elev), elev) + ralt
+            beam = np.where(cover, beam, np.nan)
+            save_png(classify_rgba(acc, ACC_LEVELS, ACC_COLORS, g.inside & cover, alpha=170), os.path.join(out, g.name, "acumulado.png"))
+            npz[f"{g.name}_frames"] = np.stack(fr_u8)
+            npz[f"{g.name}_slots"] = np.array(fr_names)
+            npz[f"{g.name}_acc"] = acc.astype(np.float32)
+            npz[f"{g.name}_beam"] = beam.astype(np.float32)
+            gmeta[g.name] = {"bounds": g.bounds, "frames": frames, "acumulado_png": f"{site}/{g.name}/acumulado.png",
+                             "cobertura_frac": round(float(cover[g.inside].mean()), 3),
+                             "acumulado_max_mm": round(float(np.max(acc[g.inside & cover])) if (g.inside & cover).any() else 0.0, 1)}
+            if g.name == "local":
+                ic, jc = len(g.lats) // 2, len(g.lons) // 2
+                near5 = geo.geodesic(C.SITE_LAT_DEG, C.SITE_LON_DEG, g.LAT, g.LON)[1] <= 5000.0
+                gmeta["local"]["acumulado_belen_mm"] = round(float(acc[ic, jc]), 1) if cover[ic, jc] else None
+                gmeta["local"]["serie_belen"] = [{
+                    "t_utc": t.isoformat(),
+                    "dbz_belen": None if not np.isfinite(res["local"][0][ic, jc]) else round(float(res["local"][0][ic, jc]), 1),
+                    "r_max5km_mmh": round(float(np.max(dbz_to_rate_mmh(res["local"][0])[near5])), 2)}
+                    for t, _, res, _ in scans]
+        np.savez_compressed(os.path.join(out, "grids.npz"), **npz)
 
-        meta = {"dia_local": day_local.isoformat(), "zona_horaria": "UTC-05:00", "completo": bool(complete)}
-        if scans:
-            _, _, _, field, elev, rlat, rlon, ralt = scans[0]
-            dist = float(geo.geodesic(rlat, rlon, C.SITE_LAT_DEG, C.SITE_LON_DEG)[1])
-            r_sl = float(geo.slant_from_ground_m(dist, elev))
-            h_beam = float(geo.beam_height_m(r_sl, elev)) + ralt
-            elevs = sorted({round(s[4], 2) for s in scans})
-            meta.update({
-                "radar": {"sitio": C.RADAR_SITE, "lat": rlat, "lon": rlon, "alt_m": ralt,
-                          "campo": field, "elevaciones_usadas_deg": elevs},
-                "geometria_belen": {
-                    "distancia_km": round(dist / 1000, 1),
-                    "elevacion_deg": elevs[0],
-                    "altura_centro_haz_msnm": round(h_beam),
-                    "altura_sitio_msnm": C.SITE_ALT_M,
-                    "margen_sobre_sitio_m": round(h_beam - C.SITE_ALT_M),
-                    "modelo": "Tierra efectiva 4/3 (Doviak & Zrnić 1993, ec. 2.28b)",
-                },
-            })
+        dist = float(geo.geodesic(rlat, rlon, C.SITE_LAT_DEG, C.SITE_LON_DEG)[1])
+        r_sl = float(geo.slant_from_ground_m(dist, elev))
+        cubre = bool(bt["cubre_belen"])
         meta.update({
-            "volumenes_listados": len(keys) if keys is not None else len(items),
-            "volumenes_tarea_elegida": len(items), "volumenes_usados": len(scans), "omitidos": skipped,
-            "tareas_por_minuto_mod5": tareas,
-            "brecha_max_min": round(max(gaps), 1) if gaps else None,
-            "zr": {"a": C.ZR_A, "b": C.ZR_B, "ref": "Marshall & Palmer (1948)",
-                   "umbral_dbz": C.RADAR_MIN_DBZ, "tope_granizo_dbz": C.RADAR_HAIL_CAP_DBZ,
-                   "dt_max_min": C.RADAR_MAX_DT_MIN},
-            "acumulado_belen_mm": round(float(acc[ic, jc]), 1),
-            "acumulado_max_ventana_mm": round(float(np.max(acc[inside])), 1),
-            "bounds": bounds, "acumulado_png": f"radar/{day_local:%Y%m%d}/acumulado.png",
-            "frames": frames, "serie_belen": series,
+            "estado": "ok",
+            "radar": {"sitio": site, "lat": rlat, "lon": rlon, "alt_m": ralt, "campo": v0["field"],
+                      "elevacion_deg": round(elev, 2), "alcance_km": round(v0["reach_m"] / 1000, 1),
+                      "coordenadas": "leídas del archivo IRIS"},
+            "geometria_belen": {
+                "distancia_km": round(dist / 1000, 1), "cubre_belen": cubre,
+                "altura_centro_haz_msnm": round(float(geo.beam_height_m(r_sl, elev)) + ralt) if cubre and np.isfinite(r_sl) else None,
+                "altura_sitio_msnm": C.SITE_ALT_M,
+                "modelo": "Tierra efectiva 4/3 (Doviak & Zrnić 1993, ec. 2.28b)"},
+            "volumenes_usados": len(scans), "brecha_max_min": round(max(gaps), 1) if gaps else None,
+            "zr": {"a": C.ZR_A, "b": C.ZR_B, "ref": "Marshall & Palmer (1948)", "umbral_dbz": C.RADAR_MIN_DBZ,
+                   "tope_granizo_dbz": C.RADAR_HAIL_CAP_DBZ, "dt_max_min": C.RADAR_MAX_DT_MIN},
+            "mallas": gmeta,
             "fuente": {"nombre": "IDEAM – Red de radares (AWS Open Data)", "licencia": "CC BY 4.0",
-                       "url": "https://registry.opendata.aws/ideam-radares/",
-                       "bucket": f"s3://{C.RADAR_BUCKET}", "archivos": used_keys},
+                       "url": "https://registry.opendata.aws/ideam-radares/", "bucket": f"s3://{C.RADAR_BUCKET}",
+                       "archivos": [s[1] for s in scans]},
             "procesado_utc": dt.datetime.now(UTC).isoformat(timespec="seconds"),
         })
-        with open(os.path.join(day_dir, "meta.json"), "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False)
-        return meta
+        if meta["geometria_belen"]["altura_centro_haz_msnm"] is not None:
+            meta["geometria_belen"]["margen_sobre_sitio_m"] = meta["geometria_belen"]["altura_centro_haz_msnm"] - round(C.SITE_ALT_M)
+        meta["omitidos"] = meta["omitidos"][:200]
+        return meta, npz
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        with open(os.path.join(out, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
 
 
-def update_index(out_root):
+# ============================================================================ compuesto
+def build_composite(day_dir, sites, grids):
+    """Compuesto 'haz más bajo' a partir de los grids.npz de cada radar."""
+    data = {}
+    for s in sites:
+        p = os.path.join(day_dir, s, "grids.npz")
+        if os.path.exists(p):
+            data[s] = dict(np.load(p))
+    out = os.path.join(day_dir, "compuesto")
+    shutil.rmtree(out, ignore_errors=True)
+    meta = {"metodo": "haz más bajo: en cada celda, el radar que la cubre con el centro del haz más cercano al suelo",
+            "radares": sorted(data), "mallas": {}}
+    for g in grids:
+        avail = [s for s in data if f"{g.name}_beam" in data[s] and np.isfinite(data[s][f"{g.name}_beam"]).any()]
+        if len(avail) < 2:
+            continue
+        beams = np.stack([np.where(np.isfinite(data[s][f"{g.name}_beam"]), data[s][f"{g.name}_beam"], np.inf) for s in avail])
+        owner = np.argmin(beams, axis=0)
+        covered = np.isfinite(np.min(beams, axis=0))
+        # dominio (qué radar manda en cada celda)
+        rgba = np.zeros(owner.shape + (4,), np.uint8)
+        for i, s in enumerate(avail):
+            m = (owner == i) & covered & g.inside
+            rgba[m, :3] = _hex_rgb(C.RADARS[s]["color"])
+            rgba[m, 3] = 110
+        save_png(rgba, os.path.join(out, g.name, "dominio.png"))
+        # acumulado
+        acc = np.zeros(owner.shape)
+        for i, s in enumerate(avail):
+            acc = np.where(owner == i, data[s][f"{g.name}_acc"], acc)
+        save_png(classify_rgba(acc, ACC_LEVELS, ACC_COLORS, g.inside & covered, alpha=170), os.path.join(out, g.name, "acumulado.png"))
+        # cuadros por paso de tiempo
+        slots = sorted(set().union(*[set(data[s][f"{g.name}_slots"].tolist()) for s in avail]))
+        idx = {s: {sn: k for k, sn in enumerate(data[s][f"{g.name}_slots"].tolist())} for s in avail}
+        frames = []
+        for sn in slots:
+            have = [i for i, s in enumerate(avail) if sn in idx[s]]
+            b = np.stack([beams[i] if i in have else np.full(owner.shape, np.inf) for i in range(len(avail))])
+            own = np.argmin(b, axis=0)
+            dbz = np.full(owner.shape, np.nan)
+            for i in have:
+                s = avail[i]
+                dbz = np.where(own == i, dec_dbz(data[s][f"{g.name}_frames"][idx[s][sn]]), dbz)
+            dbz[~np.isfinite(np.min(b, axis=0))] = np.nan
+            save_png(classify_rgba(dbz, DBZ_LEVELS, DBZ_COLORS, g.inside), os.path.join(out, g.name, "frames", f"{sn}.png"))
+            frames.append({"slot": sn, "radares": [avail[i] for i in have]})
+        meta["mallas"][g.name] = {"bounds": g.bounds, "radares": avail, "frames": frames,
+                                  "acumulado_png": f"compuesto/{g.name}/acumulado.png",
+                                  "dominio_png": f"compuesto/{g.name}/dominio.png",
+                                  "fraccion_por_radar": {s: round(float(((owner == i) & covered & g.inside).sum() / max((covered & g.inside).sum(), 1)), 3)
+                                                         for i, s in enumerate(avail)}}
+        if g.name == "local":
+            ic, jc = len(g.lats) // 2, len(g.lons) // 2
+            meta["mallas"]["local"]["acumulado_belen_mm"] = round(float(acc[ic, jc]), 1)
+            meta["mallas"]["local"]["radar_en_belen"] = avail[int(owner[ic, jc])]
+    if meta["mallas"]:
+        os.makedirs(out, exist_ok=True)
+        with open(os.path.join(out, "meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
+    return meta
+
+
+# ============================================================================ índice y ejecución
+def _load(p, default):
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def update_index(out_root, estado_radares):
     rdir = os.path.join(out_root, "radar")
-    days = sorted(d for d in os.listdir(rdir) if d.isdigit()) if os.path.isdir(rdir) else []
-    for d in days[:-C.RADAR_KEEP_DAYS]:
-        shutil.rmtree(os.path.join(rdir, d), ignore_errors=True)
-    days = days[-C.RADAR_KEEP_DAYS:]
-    idx = []
+    os.makedirs(rdir, exist_ok=True)
+    days = sorted(d for d in os.listdir(rdir) if d.isdigit())
+    keep_fixed = set(C.RADAR_KEEP_EXTRA_DAYS) | set(estado_radares.get("_dias_fijos", []))
+    recent = [d for d in days if d not in keep_fixed][-C.RADAR_KEEP_DAYS:]
     for d in days:
-        try:
-            with open(os.path.join(rdir, d, "meta.json"), encoding="utf-8") as f:
-                m = json.load(f)
-            idx.append({"dia": d, "completo": m.get("completo"), "volumenes": m.get("volumenes_usados"),
-                        "acumulado_belen_mm": m.get("acumulado_belen_mm")})
-        except FileNotFoundError:
-            pass
+        if d not in recent and d not in keep_fixed:
+            shutil.rmtree(os.path.join(rdir, d), ignore_errors=True)
+    idx = []
+    for d in sorted(set(recent) | (keep_fixed & set(days))):
+        ent = {"dia": d, "radares": {}, "compuesto": None}
+        for s in C.RADARS:
+            m = _load(os.path.join(rdir, d, s, "meta.json"), None)
+            if m:
+                ent["radares"][s] = {"estado": m.get("estado"), "completo": m.get("completo"),
+                                     "volumenes": m.get("volumenes_usados"),
+                                     "cubre_belen": (m.get("geometria_belen") or {}).get("cubre_belen")}
+        cm = _load(os.path.join(rdir, d, "compuesto", "meta.json"), None)
+        if cm:
+            ent["compuesto"] = sorted(cm["mallas"])
+        idx.append(ent)
+    radares = []
+    for s, cfg in C.RADARS.items():
+        e = estado_radares.get(s, {})
+        if not isinstance(e, dict):
+            continue
+        radares.append({"sitio": s, "color": cfg["color"], "lat": e.get("lat", cfg["lat"]), "lon": e.get("lon", cfg["lon"]),
+                        "coordenadas": e.get("coordenadas", cfg["coord_fuente"]), "alcance_km": C.RADAR_NOMINAL_RANGE_KM,
+                        "ultimo_dia_visto": e.get("ultimo_dia_visto"), "verificado": e.get("verificado")})
     with open(os.path.join(rdir, "index.json"), "w", encoding="utf-8") as f:
-        json.dump({"dias": idx}, f, ensure_ascii=False)
+        json.dump({"radares": radares, "dias": idx, "region_bounds": regional_grid().bounds}, f, ensure_ascii=False)
     return idx
 
 
-def run(out_root, today_local=None):
+def run(out_root, today_local=None, fecha=None):
     today_local = today_local or dt.datetime.now(COL).date()
     s3 = _s3()
-    day, keys, complete = find_latest_local_day(s3, today_local)
-    if day is None:
-        update_index(out_root)
-        return {"estado": "sin_datos", "buscado_hasta_dias": C.RADAR_MAX_LOOKBACK_DAYS}
-    meta_path = os.path.join(out_root, "radar", f"{day:%Y%m%d}", "meta.json")
-    if os.path.exists(meta_path):
-        with open(meta_path, encoding="utf-8") as f:
-            old = json.load(f)
-        if old.get("completo") and old.get("volumenes_listados") == len(keys):
-            update_index(out_root)
-            return {"estado": "sin_cambios", "dia": day.isoformat()}
-    meta = process_local_day(day, keys, complete, out_root, s3=s3)
-    update_index(out_root)
-    return {"estado": "procesado", "dia": day.isoformat(), "volumenes": meta["volumenes_usados"]}
+    rdir = os.path.join(out_root, "radar")
+    os.makedirs(rdir, exist_ok=True)
+    est_path = os.path.join(rdir, "estado_radares.json")
+    est = _load(est_path, {})
+    grids = [local_grid(), regional_grid()]
+    resumen, changed_days = {}, set()
+    if fecha:  # día histórico pedido a mano: se conserva aunque salga de la ventana de días recientes
+        est.setdefault("_dias_fijos", [])
+        if f"{fecha:%Y%m%d}" not in est["_dias_fijos"]:
+            est["_dias_fijos"].append(f"{fecha:%Y%m%d}")
+
+    for site in C.RADARS:
+        e = est.setdefault(site, {})
+        if e.get("verificado") != today_local.isoformat():
+            e["ultimo_dia_visto"] = last_seen(s3, site, today_local, e.get("ultimo_dia_visto"))
+            e["verificado"] = today_local.isoformat()
+        if fecha:
+            days = [fecha]
+        else:
+            days = []
+            for back in range(1, C.RADAR_MAX_LOOKBACK_DAYS + 1):
+                d = today_local - dt.timedelta(days=back)
+                if folder_exists(s3, site, d) or folder_exists(s3, site, d + dt.timedelta(days=1)):
+                    days = [d]
+                    break
+        if not days:
+            resumen[site] = {"estado": "sin datos recientes", "ultimo_dia_visto": e.get("ultimo_dia_visto")}
+            continue
+        d = days[0]
+        objs, complete = objs_for_local_day(s3, site, d)
+        if not objs:
+            resumen[site] = {"estado": f"sin volúmenes el {d}", "ultimo_dia_visto": e.get("ultimo_dia_visto")}
+            continue
+        day_dir = os.path.join(rdir, f"{d:%Y%m%d}")
+        old = _load(os.path.join(day_dir, site, "meta.json"), {})
+        if old.get("estado") == "ok" and old.get("completo") and old.get("volumenes_listados") == len(objs):
+            resumen[site] = {"estado": "sin cambios", "dia": d.isoformat()}
+            continue
+        meta, _ = process_radar_day(site, d, objs, complete, day_dir, s3, grids)
+        if meta.get("radar"):
+            e.update(lat=meta["radar"]["lat"], lon=meta["radar"]["lon"], coordenadas="leídas del archivo IRIS")
+        resumen[site] = {"estado": meta.get("estado"), "dia": d.isoformat(), "tarea": meta.get("tarea"),
+                         "volumenes": meta.get("volumenes_usados")}
+        changed_days.add(f"{d:%Y%m%d}")
+
+    for d in changed_days:
+        build_composite(os.path.join(rdir, d), list(C.RADARS), grids)
+    with open(est_path, "w", encoding="utf-8") as f:
+        json.dump(est, f, ensure_ascii=False)
+    update_index(out_root, est)
+    return resumen

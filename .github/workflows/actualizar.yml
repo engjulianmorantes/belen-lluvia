@@ -10,6 +10,10 @@ on:
         description: "Procesar radar en esta ejecución"
         type: boolean
         default: true
+      fecha:
+        description: "Día local AAAA-MM-DD a procesar (vacío = el más reciente de cada radar). Ej.: 2026-01-15 (Barrancabermeja + Carimagua + Guaviare)"
+        type: string
+        default: ""
   push:
     branches: [main]
     paths: ["site/**", "pipeline/**", ".github/workflows/**"]
@@ -24,7 +28,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
@@ -56,6 +60,7 @@ jobs:
         env:
           OUT_DIR: ${{ github.workspace }}/pub/data
           EARTHDATA_TOKEN: ${{ secrets.EARTHDATA_TOKEN }}
+          RADAR_FECHA: ${{ inputs.fecha }}
         run: |
           if [ "${{ github.event.schedule }}" = "41 */6 * * *" ] || [ "${{ inputs.radar }}" = "true" ]; then
             python build.py

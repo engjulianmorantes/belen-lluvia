@@ -14,12 +14,26 @@ Un proceso de GitHub Actions descarga y procesa los datos y los publica como arc
 
 Cada JSON publicado guarda la URL exacta de la consulta, la hora de consulta y, en el radar, la lista de archivos IRIS usados (`data/radar/AAAAMMDD/meta.json`).
 
+## Radares y superposición
+
+La app procesa **Barrancabermeja, Carimagua y Guaviare** (`RADARS` en `pipeline/config.py`) en dos escalas:
+
+- **Belén · 40 km**: solo los radares que alcanzan Belén. Guaviare queda a 383,4 km, más que el alcance nominal de 300 km, así que no lo alcanza.
+- **Regional · 3 radares**: malla de 0,025° (≈ 2,8 km) que contiene los 300 km de los tres radares.
+
+En el mapa se puede **superponer** cualquier combinación de radares (cada capa semitransparente), el **compuesto** y el **mapa de dominio**, y activar los anillos de alcance.
+
+- **Compuesto "haz más bajo"**: en cada celda y paso de tiempo se usa el radar que la cubre con el centro del haz más cercano al suelo.
+- **Mapa de dominio**: muestra qué radar manda en cada celda.
+
+**Disponibilidad (revisada el 25-nov-2026):** Carimagua aparece en el bucket solo de forma intermitente. Hay datos el 15-ago-2025 y el 15-ene-2026, pero no el 15-oct-2025 ni en las fechas revisadas de mar, jun, sep y nov-2026. La tabla de radares muestra el último día en que cada uno se vio en el bucket. Para ver la superposición con datos reales, corre el workflow con `fecha` = un día en que hubo datos de los tres (p. ej. `2026-01-15`). Ese día queda fijo y no se borra.
+
 ## Metodología del radar
 
 1. **Día local** (UTC−5): se toman los volúmenes cuyo sello (UTC, en el nombre del archivo) cae dentro de [00:00, 24:00) hora local. El bucket organiza las carpetas por día local; por robustez se listan D y D+1.
 2. **Duplicados**: cada volumen se publica dos veces, con extensiones `.RAW7xxx` y `.RAWZxxx`, mismo tamaño y mismo ETag. Se conserva uno por sello de tiempo.
-3. **Tarea**: el radar corre 4 tareas por ciclo de 5 min (a los :x0, :x1, :x2 y :x3 aprox.; observado en nov-2026). Se prueba un volumen de cada una y se usa **solo** la que cubre toda la ventana con la menor elevación. Mezclar tareas daría elevaciones distintas entre cuadros. El resultado queda en `meta.json → tareas_por_minuto_mod5`.
-4. **Barrido**: dentro de cada volumen se usa el barrido de menor elevación que cubre los 40 km alrededor de Belén. Campo `DBZH`.
+3. **Tarea**: cada radar corre varias tareas IRIS por ciclo de 5 min (Barrancabermeja 4; Carimagua ~10, con volúmenes distintos que comparten el mismo sello de tiempo). Se leen los volúmenes de una ventana de 30 min y se identifica la tarea por el atributo `scan_name`. Se elige la de menor elevación que alcanza Belén; si ninguna lo alcanza (Guaviare), la de mayor alcance. Al abrir cada volumen se verifica la tarea y la elevación. Queda registrado en `meta.json → tareas_probadas`.
+4. **Duplicados**: se eliminan por (sello de tiempo, tamaño), no solo por sello. Así no se descarta ningún volumen distinto de Carimagua.
 5. **Remuestreo**: cada celda de la malla (0,005°) toma la compuerta más cercana en azimut (máximo 1°) y en rango oblicuo. La distancia sobre la superficie se convierte a rango oblicuo con el modelo de Tierra efectiva 4/3 (Doviak & Zrnić, 1993, ec. 2.28b y 2.28c). Se verificó con un archivo IRIS real: 200 de 200 compuertas recuperadas exactamente.
 6. **Z–R** de Marshall & Palmer (1948): Z = 200·R^1,6, con R en mm/h y Z en mm⁶/m³. Por debajo de 10 dBZ se toma R = 0. Por encima de 53 dBZ se topa el valor para no convertir granizo en lluvia.
 7. **Acumulado**: Σ R·Δt, con Δt = min(t₍ᵢ₊₁₎ − tᵢ, 10 min).

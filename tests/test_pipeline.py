@@ -20,15 +20,24 @@ REAL = ["BAR261124180004.RAW7HT7", "BAR261124180004.RAWZU7V", "BAR261124180108.R
         "BAR261124180504.RAWZU83"]
 
 
-def test_dedupe_pairs():
-    out = radar.dedupe([P + k for k in REAL])
+def test_dedupe_pairs_same_size():
+    objs = [{"Key": P + k, "Size": 100} for k in REAL]
+    out = radar.dedupe(objs)
     assert len(out) == 5
-    assert len({radar.key_time_utc(k) for k in out}) == 5
 
 
-def test_task_classes():
-    cls = [radar.task_class(radar.key_time_utc(P + k)) for k in REAL[::2]]
-    assert cls == [0, 1, 2, 3, 0]
+def test_dedupe_keeps_same_time_different_size():
+    # Carimagua 15-ene-2026: dos volúmenes DISTINTOS con el mismo sello (1038336 y 3618816 bytes)
+    pc = "l2_data/2026/01/15/Carimagua/"
+    objs = [{"Key": pc + "CAR260115000123.RAWNBJJ", "Size": 1038336},
+            {"Key": pc + "CAR260115000123.RAWV59B", "Size": 3618816}]
+    assert len(radar.dedupe(objs)) == 2
+
+
+def test_cycle_offset_and_slots():
+    t = radar.key_time_utc(P + "BAR261124180239.RAW7HTE")
+    assert radar.cycle_offset_s(t) == 159
+    assert radar.slot_name(t, 10) == "1800" and radar.slot_name(t, 30) == "1800"
 
 
 def test_local_day_from_two_folders():
@@ -41,13 +50,31 @@ def test_local_day_from_two_folders():
             names = {"24": ["BAR261124045739.RAW1", "BAR261124050004.RAW2", "BAR261124050004.RAWZ",
                             "BAR261125045500.RAW3", "BAR261125050004.RAW4"],
                      "25": ["BAR261125050004.RAW4", "BAR261125120000.RAW5"]}.get(day, [])
-            return [{"Contents": [{"Key": Prefix + n} for n in names]}]
+            return [{"Contents": [{"Key": Prefix + n, "Size": 10} for n in names]}]
 
-    keys, complete = radar.keys_for_local_day(FakeS3(), dt.date(2026, 11, 24))
-    names = [os.path.basename(k)[:15] for k in keys]
-    # 04:57:39 UTC = 23:57 del 23 local → fuera; 05:00:04 UTC del 25 = 00:00 del 25 local → fuera
+    objs, complete = radar.objs_for_local_day(FakeS3(), "Barrancabermeja", dt.date(2026, 11, 24))
+    names = [os.path.basename(o["Key"])[:15] for o in objs]
     assert names == ["BAR261124050004", "BAR261125045500"]
-    assert complete  # último volumen 23:55 local ≥ 24:00 − 20 min
+    assert complete
+
+
+def test_polar_to_grid_wraparound():
+    import xarray as xr
+    az = np.array([359.5, 0.5, 1.5, 180.0])
+    rng = np.arange(125.0, 50000.0, 250.0)
+    data = np.zeros((4, rng.size)); data[0] = 10; data[1] = 20; data[2] = 30; data[3] = 40
+    ds = xr.Dataset({"DBZH": (("azimuth", "range"), data)}, coords={"azimuth": az, "range": rng})
+    g_az = np.array([[359.9, 0.1, 1.4, 180.2, 90.0]])
+    g_gr = np.full(g_az.shape, 10000.0)
+    out, cov = radar.polar_to_grid(ds, "DBZH", 0.5, g_az, g_gr)
+    assert out[0, :4].tolist() == [10, 20, 30, 40]
+    assert not cov[0, 4]  # 90° está a >1° de cualquier rayo
+
+
+def test_enc_dec_dbz():
+    v = np.array([np.nan, -10.0, 23.5, 60.0])
+    d = radar.dec_dbz(radar.enc_dbz(v))
+    assert np.isnan(d[0]) and np.allclose(d[1:], v[1:])
 
 
 def test_zr_marshall_palmer():

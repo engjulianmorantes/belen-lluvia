@@ -49,3 +49,10 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 footer{max-width:980px;margin:0 auto;padding:8px 16px 28px;font-size:11px;color:var(--muted)}
 svg text{font-size:10px;fill:var(--muted)}
 .leaflet-tooltip{font-size:12px}
+.layers{display:flex;flex-direction:column;gap:4px;margin:8px 0;font-size:13px}
+.chk{display:flex;align-items:center;gap:6px}
+.chk.off{opacity:.55}
+.sw{display:inline-block;width:14px;height:10px;border-radius:2px;margin-right:2px;vertical-align:middle}
+.day{display:flex;gap:8px;align-items:center;font-size:13px;margin:4px 0}
+.day select{flex:1;padding:6px;border:1px solid var(--line);border-radius:6px;background:#fff}
+.scroll-x{overflow-x:auto}
