@@ -202,7 +202,7 @@ function renderGeom(m) {
     <tr><td>Acumulado radar en Belén (${esc(m.dia_local)})</td><td class="num">${num(m.acumulado_belen_mm)} mm</td></tr>
     <tr><td>Z–R</td><td class="num">Z = ${m.zr.a}·R<sup>${m.zr.b}</sup> (${esc(m.zr.ref)}), umbral ${m.zr.umbral_dbz} dBZ, tope ${m.zr.tope_granizo_dbz} dBZ</td></tr>
     </tbody></table>
-    <p class="note">${esc(g.modelo)}. ${warn ? "El haz pasa muy cerca del terreno: hay bloqueo parcial y la lámina estimada sobre Belén es indicativa, no medida. " : ""}Sin corrección de bloqueo, atenuación ni ajuste con pluviómetros.</p>`;
+    <p class="note">${esc(g.modelo)}. ${warn ? "El haz pasa muy cerca del terreno: hay bloqueo parcial y la lámina estimada sobre Belén es indicativa, no medida. " : `El haz muestrea a ~${num(g.altura_centro_haz_msnm / 1000, 1)} km s.n.m.: puede quedar por encima de la lluvia de nubes bajas o dentro de la capa de fusión, y el trayecto de 140 km cruza la cordillera; tiende a subestimar la lluvia orográfica. `}Sin corrección de bloqueo, atenuación ni ajuste con pluviómetros.</p>`;
 }
 
 function renderSources(estado, parts) {
@@ -210,7 +210,9 @@ function renderSources(estado, parts) {
   for (const [key, obj] of parts) {
     const p = estado?.pasos?.[key];
     const f = obj?.fuente || {};
-    rows.push(`<div class="src"><b>${esc(f.nombre || key)}</b> ${p ? (p.ok ? '<span class="ok">● ok</span>' : `<span class="err">● error: ${esc(p.error)}</span>`) : ""}<br>
+    const st = !p ? "" : !p.ok ? `<span class="err">● error: ${esc(p.error)}</span>`
+      : (obj?.estado && obj.estado !== "ok") ? `<span class="muted">● ${esc(obj.estado)}</span>` : '<span class="ok">● ok</span>';
+    rows.push(`<div class="src"><b>${esc(f.nombre || key)}</b> ${st}<br>
       ${f.licencia ? `Licencia: ${esc(f.licencia)} · ` : ""}${obj?.consultado_utc ? `Consultado: ${fmtDT.format(new Date(obj.consultado_utc))}` : ""}${obj?.procesado_utc ? `Procesado: ${fmtDT.format(new Date(obj.procesado_utc))}` : ""}<br>
       ${f.url ? `<a href="${esc(f.url)}" target="_blank" rel="noopener">${esc(f.url)}</a>` : ""}
       ${f.consulta_series ? `<br>Consulta exacta: <a href="${esc(f.consulta_series)}" target="_blank" rel="noopener">datos.gov.co (SoQL)</a>` : ""}
