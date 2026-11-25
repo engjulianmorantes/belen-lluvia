@@ -173,7 +173,7 @@ function renderForecast(fc) {
   const pts = h.map((x, i) => `${P.l + i * bw + bw / 2},${yp(x.prob ?? 0)}`).join(" ");
   s += `<polyline points="${pts}" fill="none" stroke="#f58c14" stroke-width="1.5"/>`;
   for (const p of [0, 50, 100]) s += `<text x="${W - P.r + 4}" y="${yp(p) + 3}">${p}</text>`;
-  s += `</svg><div class="note">Barras: precipitación horaria (mm). Línea naranja: probabilidad de precipitación (%). Modelo numérico vía Open-Meteo; no es observación.</div>`;
+  s += `</svg><div class="note">Barras: precipitación horaria (mm). Línea naranja: probabilidad de precipitación (%). Modelo numérico vía Open-Meteo; no es observación. La probabilidad sale de un ensamble de modelos y la lámina de un modelo determinístico (best_match): pueden no coincidir (p. ej. 0 mm con 90 %).</div>`;
   $("fc-chart").innerHTML = s;
   $("fc-days").innerHTML = fc.diario.map(d => `<div>${fmtD.format(new Date(d.d + "T12:00:00-05:00"))}<b>${num(d.mm)} mm</b>${d.prob ?? "—"} %</div>`).join("");
 }
