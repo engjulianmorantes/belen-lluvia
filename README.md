@@ -52,7 +52,7 @@ En el mapa se puede **superponer** cualquier combinación de radares (cada capa 
 5. **Settings → Pages**: Source = *Deploy from a branch*, rama `gh-pages`, carpeta `/ (root)`.
 6. Abre `https://<usuario>.github.io/belen-lluvia/` en Chrome Android → menú ⋮ → **Instalar app**.
 
-Programación: estaciones, IMERG y pronóstico cada hora (minuto 17); radar cada 6 h.
+Programación: cada hora (minuto 17) se actualizan estaciones, IMERG, pronóstico y radar. El radar solo se reprocesa cuando cambia el número de volúmenes del día en el bucket; si no hay cambios, la revisión dura ~1 s. Un día nuevo tarda ~7 min por radar en procesarse. Los cambios de código (push) publican sin procesar radar.
 
 ## Ejecutar en local
 ```bash
