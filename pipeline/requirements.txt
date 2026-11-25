@@ -1,0 +1,8 @@
+numpy>=1.26
+xarray>=2024.10
+xradar>=0.8
+pyproj>=3.6
+pillow>=10
+requests>=2.31
+boto3>=1.34
+h5py>=3.10
