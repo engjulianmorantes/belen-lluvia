@@ -547,6 +547,14 @@ def run(out_root, today_local=None, fecha=None):
     est_path = os.path.join(rdir, "estado_radares.json")
     est = _load(est_path, {})
     grids = [local_grid(), regional_grid()]
+    # Migración: la versión de un solo radar guardaba meta.json/frames/acumulado.png directo en el día
+    for d in (x for x in os.listdir(rdir) if x.isdigit()):
+        for legacy in ("meta.json", "acumulado.png", "frames"):
+            p = os.path.join(rdir, d, legacy)
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            elif os.path.exists(p):
+                os.remove(p)
     resumen, changed_days = {}, set()
     if fecha:  # día histórico pedido a mano: se conserva aunque salga de la ventana de días recientes
         est.setdefault("_dias_fijos", [])
