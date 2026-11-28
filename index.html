@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f2a3d">
+<title>Lluvia · Belén, Boyacá</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div>
+    <h1>Lluvia · Belén, Boyacá</h1>
+    <p id="updated">Cargando…</p>
+  </div>
+  <button id="reload" title="Recargar datos" aria-label="Recargar datos">⟳</button>
+</header>
+
+<main>
+  <section id="now" class="card hero">
+    <h2>Estación más cercana</h2>
+    <div id="now-body" class="muted">—</div>
+  </section>
+
+  <section class="card map-card">
+    <div id="map"></div>
+    <div class="map-controls">
+      <div class="seg" id="scale" role="tablist">
+        <button data-scale="local" class="on">Belén · 40 km</button>
+        <button data-scale="regional">Regional · 3 radares</button>
+      </div>
+      <div class="seg" id="prod" role="tablist">
+        <button data-prod="frames" class="on">Reflectividad</button>
+        <button data-prod="acc">Acumulado del día</button>
+        <button data-prod="none">Sin radar</button>
+      </div>
+      <label class="day">Día de radar <select id="day"></select></label>
+      <div id="layers" class="layers"></div>
+      <div class="player" id="player">
+        <button id="play" aria-label="Reproducir">▶</button>
+        <input id="slider" type="range" min="0" max="0" value="0" aria-label="Hora del barrido">
+        <span id="frame-time">—</span>
+      </div>
+      <div id="legend" class="legend"></div>
+      <p id="radar-note" class="note"></p>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Pronóstico (modelo) — próximas 48 h</h2>
+    <div id="fc-chart"></div>
+    <div id="fc-days" class="days"></div>
+  </section>
+
+  <section class="card">
+    <h2>Estaciones IDEAM en 40 km</h2>
+    <div id="stations"></div>
+  </section>
+
+  <section class="card">
+    <h2>Satélite GPM IMERG — últimas 24 h</h2>
+    <div id="imerg"></div>
+  </section>
+
+  <section class="card">
+    <h2>Radares IDEAM — comparación sobre Belén</h2>
+    <div id="radar-geom"></div>
+  </section>
+
+  <section class="card">
+    <h2>Fuentes y trazabilidad</h2>
+    <div id="sources"></div>
+  </section>
+</main>
+
+<footer>
+  Datos: IDEAM (CC BY 4.0 / CC BY-SA 4.0), NASA GPM, Open-Meteo (CC BY 4.0), © OpenStreetMap.
+  Herramienta informativa; no reemplaza alertas oficiales del IDEAM ni de la UNGRD.
+</footer>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script src="app.js"></script>
+</body>
+</html>
